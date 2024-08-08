@@ -5,6 +5,10 @@ import { createPrivateKey } from 'node:crypto';
 import { sign } from 'jsonwebtoken';
 import { PostFilterPreparedRequest } from '../../../common/relay/prepareRequest';
 import { makeRequestToDownstream } from '../../../common/http/request';
+import { maskSCMToken } from '../../../common/utils/token';
+import { getPluginsConfig } from '../../../common/config/pluginsConfig';
+import { replace } from '../../../common/utils/replace-vars';
+
 export class Plugin extends BrokerPlugin {
   // Plugin Code and Name must be unique across all plugins.
   pluginCode = 'GITHUB_SERVER_APP_PLUGIN';
@@ -27,11 +31,17 @@ export class Plugin extends BrokerPlugin {
 
   // Function running upon broker client startup
   // Useful for credentials retrieval, initial setup, etc...
-  async startUp(connectionConfig): Promise<void> {
+  async startUp(connectionConfig, pluginsConfig?): Promise<void> {
     try {
       this.logger.info({ plugin: this.pluginName }, 'Running Startup');
-      this.logger.debug(
-        { plugin: this.pluginCode, config: connectionConfig },
+      this.logger.trace(
+        {
+          plugin: this.pluginCode,
+          config: connectionConfig,
+          pluginConfig: pluginsConfig
+            ? pluginsConfig[connectionConfig.friendlyName]
+            : {},
+        },
         'Connection Config passed to the plugin',
       );
       if (
@@ -57,23 +67,34 @@ export class Plugin extends BrokerPlugin {
 
       // Generate the JWT
       const now = Date.now();
-      connectionConfig.JWT_TOKEN = this._getJWT(
-        Math.floor(now / 1000), // Current time in seconds
-        connectionConfig.GITHUB_APP_PRIVATE_PEM_PATH,
-        connectionConfig.GITHUB_APP_ID,
-      );
+      getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN =
+        this._getJWT(
+          Math.floor(now / 1000), // Current time in seconds
+          connectionConfig.GITHUB_APP_PRIVATE_PEM_PATH,
+          connectionConfig.GITHUB_APP_ID,
+        );
+      if (!getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN) {
+        throw new Error(`GHSA Plugin Error: could not get JWT.`);
+      }
       this._setJWTLifecycleHandler(now, connectionConfig);
 
-      connectionConfig.accessToken = await this._getAccessToken(
-        connectionConfig.GITHUB_API,
-        connectionConfig.GITHUB_APP_INSTALLATION_ID,
-        connectionConfig.JWT_TOKEN,
-      );
-      connectionConfig.ACCESS_TOKEN = JSON.parse(
-        connectionConfig.accessToken,
-      ).token;
-      if (connectionConfig.ACCESS_TOKEN) {
+      getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken =
+        await this._getAccessToken(
+          connectionConfig.GITHUB_API,
+          connectionConfig.GITHUB_APP_INSTALLATION_ID,
+          getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN,
+        );
+      if (!getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken) {
+        throw new Error(`GHSA Plugin Error: could not get Access Token.`);
+      }
+      getPluginsConfig()[connectionConfig.friendlyName].GHSA_ACCESS_TOKEN =
+        JSON.parse(
+          getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken,
+        ).token;
+      if (getPluginsConfig()[connectionConfig.friendlyName].GHSA_ACCESS_TOKEN) {
         this._setAccessTokenLifecycleHandler(connectionConfig);
+      } else {
+        throw new Error(`GHSA Plugin Error: could not extract access token.`);
       }
     } catch (err) {
       this.logger.error(
@@ -106,7 +127,7 @@ export class Plugin extends BrokerPlugin {
 
   _setJWTLifecycleHandler(now: number, connectionConfig) {
     try {
-      if (connectionConfig.JWT_TOKEN) {
+      if (getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN) {
         let timeoutHandlerId;
         let timeoutHandler = async () => {};
         timeoutHandler = async () => {
@@ -117,11 +138,15 @@ export class Plugin extends BrokerPlugin {
             );
             clearTimeout(timeoutHandlerId);
             const timeoutHandlerNow = Date.now();
-            connectionConfig.JWT_TOKEN = await this._getJWT(
-              Math.floor(timeoutHandlerNow / 1000),
-              connectionConfig.GITHUB_APP_PRIVATE_PEM_PATH,
-              connectionConfig.GITHUB_APP_ID,
-            );
+            getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN =
+              await this._getJWT(
+                Math.floor(timeoutHandlerNow / 1000),
+                connectionConfig.GITHUB_APP_PRIVATE_PEM_PATH,
+                connectionConfig.GITHUB_APP_ID,
+              );
+            if (!getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN) {
+              throw new Error(`GHSA Plugin Error: could not  refreshed JWT.`);
+            }
             if (process.env.NODE_ENV != 'test') {
               timeoutHandlerId = setTimeout(
                 timeoutHandler,
@@ -129,7 +154,9 @@ export class Plugin extends BrokerPlugin {
                   timeoutHandlerNow + this.JWT_TTL,
                 ) - 10000,
               );
-              connectionConfig.jwtTimeoutHandlerId = timeoutHandlerId;
+              getPluginsConfig()[
+                connectionConfig.friendlyName
+              ].jwtTimeoutHandlerId = timeoutHandlerId;
             }
           } catch (err) {
             this.logger.error(
@@ -144,7 +171,8 @@ export class Plugin extends BrokerPlugin {
           timeoutHandler,
           this._getTimeDifferenceInMsToFutureDate(now + this.JWT_TTL) - 10000,
         );
-        connectionConfig.jwtTimeoutHandlerId = timeoutHandlerId;
+        getPluginsConfig()[connectionConfig.friendlyName].jwtTimeoutHandlerId =
+          timeoutHandlerId;
       }
     } catch (err) {
       this.logger.error(
@@ -190,7 +218,7 @@ export class Plugin extends BrokerPlugin {
   }
 
   _setAccessTokenLifecycleHandler(connectionConfig) {
-    if (connectionConfig.accessToken) {
+    if (getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken) {
       let timeoutHandlerId;
       let timeoutHandler = async () => {};
       timeoutHandler = async () => {
@@ -200,28 +228,56 @@ export class Plugin extends BrokerPlugin {
             'Refreshing github app access token',
           );
           clearTimeout(timeoutHandlerId);
-          connectionConfig.accessToken = await this._getAccessToken(
-            connectionConfig.GITHUB_API,
-            connectionConfig.GITHUB_APP_INSTALLATION_ID,
-            connectionConfig.JWT_TOKEN,
-          );
-          connectionConfig.ACCESS_TOKEN = JSON.parse(
-            connectionConfig.accessToken,
-          ).token;
+          getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken =
+            await this._getAccessToken(
+              connectionConfig.GITHUB_API,
+              connectionConfig.GITHUB_APP_INSTALLATION_ID,
+              getPluginsConfig()[connectionConfig.friendlyName].JWT_TOKEN,
+            );
+          getPluginsConfig()[connectionConfig.friendlyName].GHSA_ACCESS_TOKEN =
+            JSON.parse(
+              getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken,
+            ).token;
+
+          if (
+            !getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken
+          ) {
+            throw new Error(
+              `GHSA Plugin Error: could not get refreshed Access Token.`,
+            );
+          } else {
+            this.logger.debug(
+              {
+                accessToken: maskSCMToken(
+                  getPluginsConfig()[connectionConfig.friendlyName]
+                    .GHSA_ACCESS_TOKEN,
+                ),
+              },
+              `Access token renewed!`,
+            );
+          }
           this.logger.debug(
             { plugin: this.pluginCode },
             `Refreshed access token expires at ${
-              JSON.parse(connectionConfig.accessToken).expires_at
+              JSON.parse(
+                getPluginsConfig()[connectionConfig.friendlyName]
+                  .ghsaAccessToken,
+              ).expires_at
             }`,
           );
           if (process.env.NODE_ENV != 'test') {
             timeoutHandlerId = setTimeout(
               timeoutHandler,
               this._getTimeDifferenceInMsToFutureDate(
-                JSON.parse(connectionConfig.accessToken).expires_at,
+                JSON.parse(
+                  getPluginsConfig()[connectionConfig.friendlyName]
+                    .ghsaAccessToken,
+                ).expires_at,
               ) - 10000,
             );
-            connectionConfig.accessTokenTimeoutHandlerId = timeoutHandlerId;
+            getPluginsConfig()[
+              connectionConfig.friendlyName
+            ].ghsaAccessTokenTimeoutHandlerId = timeoutHandlerId;
           }
         } catch (err) {
           this.logger.error(
@@ -234,10 +290,14 @@ export class Plugin extends BrokerPlugin {
       timeoutHandlerId = setTimeout(
         timeoutHandler,
         this._getTimeDifferenceInMsToFutureDate(
-          JSON.parse(connectionConfig.accessToken).expires_at,
+          JSON.parse(
+            getPluginsConfig()[connectionConfig.friendlyName].ghsaAccessToken,
+          ).expires_at,
         ) - 10000,
       );
-      connectionConfig.accessTokenTimeoutHandlerId = timeoutHandlerId;
+      getPluginsConfig()[
+        connectionConfig.friendlyName
+      ].ghsaAccessTokenTimeoutHandlerId = timeoutHandlerId;
     }
   }
   _getTimeDifferenceInMsToFutureDate(targetDate) {
@@ -248,14 +308,30 @@ export class Plugin extends BrokerPlugin {
   }
 
   // Hook to run pre requests operations - Optional. Uncomment to enable
-  // async preRequest(
-  //   connectionConfiguration: Record<string, any>,
-  //   postFilterPreparedRequest: PostFilterPreparedRequest,
-  // ) {
-  //   this.logger.debug(
-  //     { plugin: this.pluginName, connection: connectionConfiguration },
-  //     'Running prerequest plugin',
-  //   );
-  //   return postFilterPreparedRequest;
-  // }
+  async preRequest(
+    connectionConfiguration: Record<string, any>,
+    postFilterPreparedRequest: PostFilterPreparedRequest,
+  ) {
+    this.logger.debug(
+      { plugin: this.pluginName, connection: connectionConfiguration },
+      'Running prerequest plugin',
+    );
+
+    const regexPattern = /\$[A-Za-z0-9_%]+/g;
+    const matches = postFilterPreparedRequest.url.match(regexPattern);
+    if (matches) {
+      for (const pathPart of matches) {
+        const source = replace(
+          `${pathPart.replace('$', '${')}}`,
+          connectionConfiguration,
+        ); // replace the variables
+        postFilterPreparedRequest.url = postFilterPreparedRequest.url.replace(
+          pathPart,
+          source,
+        );
+      }
+    }
+
+    return postFilterPreparedRequest;
+  }
 }
